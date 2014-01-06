@@ -322,6 +322,7 @@ if( isset($_POST['sent_from']) ){
       $skus[$i]['name'] = $row[2];
       $i++;
     }
+    $result->close();
   }
 
   # see if we just scheduled a mail
