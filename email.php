@@ -65,10 +65,10 @@ if( isset($_POST['sent_from']) ){
 
     if($target == "all"){
       $tolist = '--ALL--';
-      $sqlwhere = '';
+      $sqlwhere = 'WHERE ';
     } else {
       $tolist = $mysqli->real_escape_string($tolist);
-      $sqlwhere = "JOIN order_items oi ON o.id = oi.order_id WHERE oi.sku = '$tolist'";
+      $sqlwhere = "JOIN order_items oi ON o.id = oi.order_id WHERE oi.sku = '$tolist' AND ";
     }
 
     $query = "INSERT INTO email_schedule_products (`email_schedule_id`, `sku`) VALUES ( ?, ? )";
@@ -79,7 +79,7 @@ if( isset($_POST['sent_from']) ){
 
     # Now we put the individual addresses into email_mgmt table
 
-    $query = "INSERT INTO email_mgmt(email, email_schedule_id) SELECT DISTINCT o.email, $last_id FROM orders o ". $sqlwhere;
+    $query = "INSERT INTO email_mgmt(email, ref_id, email_schedule_id) SELECT o.email, o.amazon_id, $last_id FROM orders o " . $sqlwhere . "NOT EXISTS (SELECT m.email FROM email_mgmt m WHERE m.email = o.email AND m.status='blocked') GROUP BY o.email";
     #die($query);
 
     $stmt = $mysqli->prepare($query);
@@ -92,11 +92,12 @@ if( isset($_POST['sent_from']) ){
 
   } elseif( $_POST['sent_from']=='add_content' ){
 
-    $content = $_POST['body'];
+    $body_text = $_POST['body_text'];
+    $body_html = $_POST['body_html'];
     $subject = $_POST['subject'];
-    $query = "INSERT INTO email_content (`subject`,`body`) VALUES ( ?, ? )";
+    $query = "INSERT INTO email_content (`subject`,`body_text`, `body_html`) VALUES ( ?, ?, ? )";
     $stmt = $mysqli->prepare($query);
-    $stmt->bind_param("ss", $subject, $content);
+    $stmt->bind_param("sss", $subject, $body_text, $body_html);
     $stmt->execute();
     $stmt->close();
     $mysqli->close();
@@ -105,11 +106,12 @@ if( isset($_POST['sent_from']) ){
   } elseif( $_POST['sent_from']=='update_content' ){
 
     $id = $_POST['content_id'];
-    $content = $_POST['content'];
+    $body_text = $_POST['body_text'];
+    $body_html = $_POST['body_html'];
     $subject = $_POST['subject'];
-    $query = "UPDATE email_content SET body = ?, subject = ? WHERE id = ? ";
+    $query = "UPDATE email_content SET body_text = ?, body_html = ?, subject = ? WHERE id = ? ";
     $stmt = $mysqli->prepare($query);
-    $stmt->bind_param("sss", $content, $subject, $id);
+    $stmt->bind_param("ssss", $body_text, $body_html, $subject, $id);
     $stmt->execute();
     $stmt->close();
     $mysqli->close();
@@ -126,49 +128,75 @@ if( isset($_POST['sent_from']) ){
     $mysqli->close();
     header('Location: email.php');
 
+  } elseif( $_POST['sent_from']=='bounced' || $_POST['sent_from']=='blocked' ){
+
+    $new_status = $_POST['sent_from'];
+    $bounced = $_POST['bounced_email'];
+    $notes = $_POST['notes'];
+    $query = "SELECT id FROM email_mgmt WHERE email = ? ORDER BY send_time DESC LIMIT 1";
+    if( $stmt = $mysqli->prepare($query) ){
+      $stmt->bind_param("s", $bounced);
+      $stmt->bind_result($id);
+      $stmt->execute();
+      while($stmt->fetch()){
+        $this_id = $id;
+      }
+      $stmt->close();
+    }
+    $query = "UPDATE email_mgmt SET status = '?', note = '?' WHERE id = ?";
+    if( $stmt = $mysqli->prepare($query) ){
+      $stmt->bind_param("sss", $new_status, $notes, $this_id);
+      $stmt->execute();
+      $stmt->close();
+    }
+    $mysqli->close();
+    header("Location: email.php?page=$new_status");
   }
 
 } elseif( isset($_GET['page']) ){
 
   $page = $_GET['page'];
 
-  if( $page == "actually_send" ){
+  if( $page == 'send_test' ){
 
-    # this should be called automatically by crontab to send scheduled emails
-    $id = 0;
-    $query = "SELECT s.id, c.subject, c.body FROM email_schedule s JOIN email_content c ON s.content_id = c.id WHERE s.status = 'pending' AND s.time < NOW() LIMIT 1";
-    if ($result = $mysqli->query($query)) {
-      if ($row = $result->fetch_row()) {
-        $id = $row[0];
-        $subject = $row[1];
-        $body = $row[2];
-      }
-    }
-    $result->close();
-
-    if($id){
-      $sendlist = array();
-      $query = "SELECT DISTINCT email FROM orders";
-      if($result = $mysqli->query($query)) {
-        while($row = $result->fetch_row()) {
-          array_push($sendlist, $row[0]);
-        }
-        $list_count = count($sendlist);
-        send_mail($subject, $body, $sendlist);
-      }
-      $result->close();
-      $query = "UPDATE email_schedule SET status = 'sent', sent_count = ?  WHERE id = ?";
-      $stmt = $mysqli->prepare($query);
-      $stmt->bind_param("ss", $list_count, $id);
+    $id = $_GET['id'];
+    $sendlist = array();
+    if ($stmt = $mysqli->prepare("SELECT subject, body_text, body_html FROM email_content where id = ?")){
+      $stmt->bind_param("s", $id);
       $stmt->execute();
+      $stmt->bind_result($subject, $body_text, $body_html);
+      while($stmt->fetch()){
+        $this_subject = $subject;
+        $this_body = $body_text;
+        $this_html = $body_html;
+      }
       $stmt->close();
-      $mysqli->close();
-      die("sent $list_count, done!");
     }
+    if ($stmt = $mysqli->prepare("SELECT address FROM email_test_addr")){
+      $stmt->execute();
+      $stmt->bind_result($addr);
+      while($stmt->fetch()){
+        array_push( $sendlist, $addr );
+      }
+      $stmt->close();
+    }
+
+    send_mail($this_subject, $this_body, $this_html, $sendlist);
+
+    $query = "UPDATE email_content SET test_count = test_count + 1, last_test = NOW() WHERE id = ? ";
+    $stmt = $mysqli->prepare($query);
+    $stmt->bind_param("s", $id);
+    $stmt->execute();
+    $stmt->close();
+    $mysqli->close();
+    header("Location: email.php?page=content&sent=$id");
+
   }
 
   print "<a href=\"email.php?page=test_email\">Addresses for testing</a>
         | <a href=\"email.php?page=content\">Email Contents</a>
+        | <a href=\"email.php?page=bounced\">Bounces</a>
+        | <a href=\"email.php?page=blocked\">Blocklist</a>
         | <a href=\"email.php\">Main</a>";
 
   if( $page == "test_email" ){
@@ -191,36 +219,80 @@ if( isset($_POST['sent_from']) ){
       $result->close();
     }
 
-  } elseif($page == "content"){
+  } elseif( $page == "bounced" || $page == "blocked" ){
 
-    if(isset($_GET['sent'])){
-      $sent = $_GET['sent'];
-    } else {
-      $sent = 0;
+    $my_status = $page;
+    print '<h2>'. ucfirst($my_status).' Addresses</h2><form action="email.php" method="POST">
+           Set Email to '. $my_status .': <input type="text" name="bounced_email" /><br>
+           Notes: <input type="text" name="notes" />
+           <input type="hidden" name="sent_from" value="'. $my_status .'">
+           <input type="submit" value="Update Email">
+           </form><br><br>';
+    $query = "SELECT email, note FROM email_mgmt WHERE status = \"$my_status\"";
+    $bounces = array();
+    if ($result = $mysqli->query($query)) {
+      while ($row = $result->fetch_row()) {
+        $this_row['email'] = $row[0];
+        $this_row['notes'] = $row[1];
+        array_push($bounces, $this_row);
+      }
+      $result->close();
+      $total = count($bounces);
+      print "<h3>$total $my_status addresses</h3><ul>";
+      foreach($bounces as $addr){
+        print "<li>".$addr['email'] ." ".  $addr['notes'] ."</li>
+";
+      }
+      print "</ul>";
     }
+
+  } elseif( $page == "content" ){
+
+    $sent = (isset($_GET['sent'])) ? $_GET['sent'] : 0 ;
+
     print '<form action="email.php" method="POST">
            Subject: <input type="text" name="subject"/>
-           <br>Body:<br><textarea name="body" rows=5 cols=50></textarea>
+           <br>Text Body:<br><textarea name="body_text" rows=5 cols=50></textarea>
+           <br>HTML Body (optional):<br><textarea name="body_html" rows=5 cols=50></textarea> 
            <input type="hidden" name="sent_from" value="add_content">
            <br><input type="submit" value="Create"></form>';
-    $query = "SELECT c.id, c.subject, c.body, s.status FROM email_content c LEFT JOIN email_schedule s ON s.content_id = c.id";
+    #$query = "SELECT c.id, c.subject, c.body_text, c.body_html, s.status FROM email_content c LEFT JOIN email_schedule s ON s.content_id = c.id";
+    $query = "SELECT c.id, c.subject, c.body_text, c.body_html FROM email_content c";
     if ($result = $mysqli->query($query)) {
       while ($row = $result->fetch_row()) {
         $id = $row[0];
         $subject = $row[1];
-        $body = $row[2];
-        $status = $row[3];
-        print "<br><br>ID: $id<br>SUBJECT: $subject<br>$body<br>";
-        if($sent == $id){
-          print "Test Sent! || ";
-        } else {
-          print "<a href=\"email.php?page=send_test&id=$id\">Send Test</a> || ";
-        }
-        if(! $status || $status != 'sent' ){
-          print "<a href=\"email.php?page=update&id=$id\">Update</a><br>";
-        } else {
-          print "Already Sent email shouldn't be changed<br>";
-        }
+        $body_text = $row[2];
+        $body_html = $row[3];
+
+        #$status = $row[3];
+        #if( $past_id != $id){
+
+          print "<br><br>ID: $id<br>SUBJECT: $subject<br>$body_text<br><textarea>$body_html</textarea><br>";
+          if($sent == $id){
+            print "Test Sent! || ";
+          } else {
+            $r = date("YmdHis");;
+            print "<a href=\"email.php?page=send_test&id=$id&r=$r\">Send Test</a> || ";
+          }
+
+          $this_status = 0;
+          $statusquery = "SELECT id FROM email_schedule WHERE content_id = $id AND status = 'sent'";
+          if($status = $mysqli->query($statusquery)){
+            while($statusrow = $status->fetch_row()) { 
+              $this_status = $statusrow[0];
+            }
+            $status->close();
+          }
+
+          if(! $this_status ){
+            print "<a href=\"email.php?page=update&id=$id\">Update</a><br>";
+          } else {
+            print "Already Sent email shouldn't be changed<br>";
+          }
+
+        #  $past_id = $id;
+        #}
       }
       $result->close();
     }
@@ -228,14 +300,15 @@ if( isset($_POST['sent_from']) ){
   } elseif( $page == 'update' ){
 
     $id = $_GET['id'];
-    if ($stmt = $mysqli->prepare("SELECT subject, body FROM email_content where id = ?")){
+    if ($stmt = $mysqli->prepare("SELECT subject, body_text, body_html FROM email_content where id = ?")){
       $stmt->bind_param("s", $id);
       $stmt->execute();
-      $stmt->bind_result($subject, $body);
+      $stmt->bind_result($subject, $body_text, $body_html);
       while($stmt->fetch()){
         print '<form action="email.php" method="POST">
            <br>SUBJECT:<input type="text" name="subject" value="'.$subject.'"><br>
-           <textarea name="content" rows=5 cols=60>'.$body.'</textarea>
+           <textarea name="body_text" rows=5 cols=60>'.$body_text.'</textarea><br>
+           <textarea name="body_html" rows=5 cols=60>'.$body_html.'</textarea>
            <input type="hidden" name="content_id" value="'.$id.'">
            <input type="hidden" name="sent_from" value="update_content">
            <input type="submit" value="Update"></form>';
@@ -247,13 +320,14 @@ if( isset($_POST['sent_from']) ){
 
     $id = $_GET['id'];
     $sendlist = array();
-    if ($stmt = $mysqli->prepare("SELECT subject, body FROM email_content where id = ?")){
+    if ($stmt = $mysqli->prepare("SELECT subject, body_text, body_html FROM email_content where id = ?")){
       $stmt->bind_param("s", $id);
       $stmt->execute();
-      $stmt->bind_result($subject, $body);
+      $stmt->bind_result($subject, $body_text, $body_html);
       while($stmt->fetch()){
         $this_subject = $subject;
-        $this_body = $body;
+        $this_body = $body_text;
+        $this_html = $body_html;
       }
       $stmt->close();
     }
@@ -266,7 +340,10 @@ if( isset($_POST['sent_from']) ){
       $stmt->close();
     }
 
-    send_mail($subject, $body, $sendlist);
+    #die("Sending $this_subject, $this_body, $this_html to ".count($sendlist));
+    #exit();
+
+    send_mail($this_subject, $this_body, $this_html, $sendlist);
 
     $query = "UPDATE email_content SET test_count = test_count + 1, last_test = NOW() WHERE id = ? ";
     $stmt = $mysqli->prepare($query);
@@ -309,6 +386,23 @@ if( isset($_POST['sent_from']) ){
       $i++;
     }
     $result->close();
+    # Loop over schedules to look for any pending or sending; get their pending count
+    $i = 0;
+    foreach($schedules as $schedule){
+      if( in_array($schedule['status'], array("pending","sending") ) ){
+        $this_id = $schedule['id'];
+        $query = "SELECT COUNT(id) FROM email_mgmt WHERE email_schedule_id = $this_id AND status = 'pending'";
+        if( $stmt = $mysqli->prepare($query) ){
+          $stmt->execute();
+          $stmt->bind_result($p_count);
+          while($stmt->fetch()){
+            $schedules[$i]['pending_count'] = $p_count;
+          }
+          $stmt->close();
+        }
+      }
+      $i++;
+    }
   }
 
   # Get array of SKUs and number sold
@@ -326,11 +420,7 @@ if( isset($_POST['sent_from']) ){
   }
 
   # see if we just scheduled a mail
-  if(isset($_GET['s'])){
-    $sch = $_GET['s'];
-  } else {
-    $sch = 0;
-  }
+  $sch = (isset($_GET['s'])) ? $_GET['s'] : 0;
 
   # start html output here, and bring in js for date picker:
   include('email_header.php');
@@ -340,11 +430,14 @@ if( isset($_POST['sent_from']) ){
   }
 
   print "<a href=\"email.php?page=test_email\">Addresses for testing</a> 
-        | <a href=\"email.php?page=content\">Email Contents</a>";
+        | <a href=\"email.php?page=content\">Email Contents</a>
+        | <a href=\"email.php?page=bounced\">Bounces</a>
+        | <a href=\"email.php?page=blocked\">Blocklist</a>";
   print "<h4>Schedule an Email</h4>";
   print '<form action="email.php" method="POST">
          <input type="hidden" name="sent_from" value="schedule">
          Email Content ID: <select name="content_id">';
+  $contents = array_reverse( $contents );
   foreach($contents as $content){
     $id = $content['id'];
     $subj = $content['subj'];
@@ -394,23 +487,24 @@ print '</select><br>
     $content_id = $schedule['content_id'];
     $status = $schedule['status'];
     $sku = $schedule['sku'];
-    if($status == 'sent'){
-      $sent = $schedule['sent'];
-    } else {
-      $sent = 0;
-    }
-    
+    $pending_count = $schedule['pending_count'];
+    $sent_count = $schedule['sent_count'];
+
     print "<li><form action=\"email.php\" method=\"POST\">$this_time Content ID: $content_id Target List: $sku ";
-    if($status == 'pending'){
-      print 'pending <input type="hidden" name="sent_from" value="cancel">
+    if($status == 'pending' || $status == 'sending'){
+      print $status.' <input type="hidden" name="sent_from" value="cancel">
         <input type="hidden" name="schedule_id" value="'.$this_id.'">
         <input type="submit" value="cancel">';
     } elseif($status == 'sent'){
-      print "Sent: $sent ";
+      print "Complete";
     } else {
       print "Cancelled";
     }
-    print '</form></li><br>
+
+    if($sent_count){ print " sent: $sent_count "; }
+    if($pending_count){ print "  pending: $pending_count "; }
+
+    print '</form></li>
           ';
   }
 
@@ -418,11 +512,35 @@ print '</select><br>
 
 $mysqli->close();
 
-function send_mail($subject, $body, $sendlist){
+
+function send_mail($subject, $body_text, $body_html, $sendlist){
+
+  #die("Sending $subject, $body_text, $body_html to ".count($sendlist));
+  #exit();
+
+  # include pear Mail packages
+  include 'Mail.php';
+  include 'Mail/mime.php';
+
+  $crlf = "\n";
+  $hdrs = array(
+              'From'    => 'Support@omniherbals.com',
+              'Subject' => $subject
+              );
+  $mime = new Mail_mime(array('eol' => $crlf));
+
+  $mime->setTXTBody($body_text);
+  $mime->setHTMLBody($body_html);
+
+  $body = $mime->get();
+  $hdrs = $mime->headers($hdrs);
+
+  $mail =& Mail::factory('mail');
+
   foreach($sendlist as $addr){
-    mail($addr, $subject, $body, "From:<support@omniherbals.com>");
-    # wait 3 seconds between sending each email:
-    sleep(3);
+    $mail->send($addr, $hdrs, $body);
+    # wait 2 seconds between sending each email:
+    sleep(2);
   }
 }
 
